@@ -1,0 +1,54 @@
+name: Deploy to server
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: Full commit SHA of an image published by successful CI
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: production-deployment
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Validate release passed CI
+        env:
+          SHA: ${{ inputs.commit_sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          COUNT=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$SHA&status=success&event=push" --jq '.workflow_runs | map(select(.head_branch == "main")) | length')
+          test "$COUNT" -gt 0
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_sha }}
+      - name: Configure SSH
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/id_ed25519
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/id_ed25519 ~/.ssh/known_hosts
+      - name: Deploy tested image
+        env:
+          SHA: ${{ inputs.commit_sha }}
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ vars.DEPLOY_USER }}
+        run: |
+          [[ "$DEPLOY_HOST" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]] || exit 1
+          [[ "$DEPLOY_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || exit 1
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}:$SHA"
+          scp compose.yaml "$DEPLOY_USER@$DEPLOY_HOST:/opt/task-service/compose.yaml"
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" "cd /opt/task-service && export APP_IMAGE='$IMAGE' && docker compose pull && docker compose run --rm migrate && docker compose up -d --no-build --wait --wait-timeout 120"
+      - name: Remove credentials
+        if: always()
+        run: rm -f ~/.ssh/id_ed25519
